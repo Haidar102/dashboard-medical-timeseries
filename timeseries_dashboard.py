@@ -4,123 +4,160 @@ import plotly.express as px
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from datetime import date
+from typing import Any, Dict, List
 
-# --- Page ---
+# ----------------------------
+# Page / App config
+# ----------------------------
 st.set_page_config(page_title="FHIR Time Series Dashboard", layout="wide", initial_sidebar_state="expanded")
-st.title("⏱️ Time Series Dashboard (FHIR)")
+st.title("🧪 Laboratory Time Series Dashboard (FHIR)")
 
-# ==========================================
-# FHIR FETCH (Pagination + Retry)
-# ==========================================
-def _safe_fhir_fetch(url, resource_type):
+# ============================
+# Helper: robust FHIR fetch (pagination + retry)
+# ============================
+def _safe_fhir_fetch(url: str, resource_type: str) -> List[Dict[str, Any]]:
     session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500,502,503,504])
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount("http://", HTTPAdapter(max_retries=retries))
     session.mount("https://", HTTPAdapter(max_retries=retries))
 
-    accumulated = []
+    accumulated: List[Dict[str, Any]] = []
     current_url = url
 
     while current_url:
         try:
-            resp = session.get(current_url, headers={"Accept":"application/fhir+json"}, timeout=30)
+            resp = session.get(current_url, headers={"Accept": "application/fhir+json"}, timeout=30)
             resp.raise_for_status()
             bundle = resp.json()
+        except Exception as e:
+            st.error(f"Fehler beim Abruf von {current_url}: {e}")
+            break
 
-            if bundle.get("resourceType") == "Bundle" and "entry" in bundle:
-                for entry in bundle["entry"]:
-                    res = entry.get("resource")
-                    if res and res.get("resourceType") == resource_type:
-                        accumulated.append(res)
+        if isinstance(bundle, dict) and bundle.get("resourceType") == "Bundle" and "entry" in bundle:
+            for entry in bundle["entry"]:
+                resource = entry.get("resource")
+                if isinstance(resource, dict) and resource.get("resourceType") == resource_type:
+                    accumulated.append(resource)
 
-            # pagination next link
-            next_url = None
-            for link in bundle.get("link", []):
+        next_url = None
+        if isinstance(bundle, dict):
+            for link in bundle.get("link", []) or []:
                 if link.get("relation") == "next" and link.get("url"):
                     next_url = link["url"]
                     break
-            current_url = next_url
-
-        except Exception as e:
-            st.error(f"Fehler beim Abruf: {e}")
-            break
+        current_url = next_url
 
     return accumulated
 
 @st.cache_data(ttl=300)
-def safe_fhir_fetch_cached(url, resource_type):
+def safe_fhir_fetch_cached(url: str, resource_type: str) -> List[Dict[str, Any]]:
     return _safe_fhir_fetch(url, resource_type)
 
-# ==========================================
-# Normalizer: Patients
-# ==========================================
-def normalize_fhir_patients(patients_list):
-    if not patients_list:
+# ============================
+# Filter: Nur Laborwerte
+# ============================
+def is_labor_observation(resource: Dict[str, Any]) -> bool:
+    """Filtert Observations, die als Laborwerte gelten."""
+    if not isinstance(resource, dict):
+        return False
+
+    if not resource.get("issued"):
+        return False
+
+    # Prüfe valueQuantity (direkt oder in Komponenten)
+    has_numeric = False
+    vq = resource.get("valueQuantity")
+    if isinstance(vq, dict) and vq.get("value") is not None:
+        has_numeric = True
+    else:
+        for comp in resource.get("component", []) or []:
+            vqc = comp.get("valueQuantity")
+            if isinstance(vqc, dict) and vqc.get("value") is not None:
+                has_numeric = True
+                break
+    if not has_numeric:
+        return False
+
+    # Kategorie prüfen
+    cats = []
+    for cat in resource.get("category", []) or []:
+        for c in (cat.get("coding") or []):
+            cats.append((c.get("code") or "").lower())
+            cats.append((c.get("display") or "").lower())
+
+    is_lab = any("laboratory" in c for c in cats)
+    return is_lab
+
+# ============================
+# Normalisierung für Laborwerte
+# ============================
+def normalize_fhir_observations(obs_list: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+
+    def _to_float(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).replace(",", ".").strip()
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    for res in obs_list:
+        if not is_labor_observation(res):
+            continue
+
+        obs_name = None
+        for c in (res.get("code", {}).get("coding") or []):
+            if isinstance(c, dict):
+                obs_name = c.get("display") or c.get("code") or obs_name
+        obs_name = obs_name or res.get("code", {}).get("text") or "Unknown Observation"
+
+        issued = res.get("issued")
+
+        # Hauptwert
+        vq = res.get("valueQuantity")
+        if isinstance(vq, dict) and vq.get("value") is not None:
+            rows.append({
+                "id": res.get("id"),
+                "observation_name": obs_name,
+                "value": _to_float(vq.get("value")),
+                "unit": vq.get("unit") or vq.get("code"),
+                "date": issued,
+            })
+
+        # Komponenten (z. B. Panelwerte)
+        for comp in res.get("component", []) or []:
+            comp_name = None
+            for cc in (comp.get("code", {}).get("coding") or []):
+                if isinstance(cc, dict):
+                    comp_name = cc.get("display") or cc.get("code") or comp_name
+            comp_name = comp_name or comp.get("code", {}).get("text")
+
+            vqc = comp.get("valueQuantity")
+            if isinstance(vqc, dict) and vqc.get("value") is not None:
+                rows.append({
+                    "id": res.get("id"),
+                    "observation_name": comp_name or obs_name,
+                    "value": _to_float(vqc.get("value")),
+                    "unit": vqc.get("unit") or vqc.get("code"),
+                    "date": issued,
+                })
+
+    if not rows:
         return pd.DataFrame()
-    df = pd.json_normalize(patients_list, sep='.')
-    def extract_name(n):
-        if isinstance(n, list) and n:
-            first = n[0]
-            family = first.get('family')
-            given = first.get('given')[0] if isinstance(first.get('given'), list) and first.get('given') else first.get('given')
-            return pd.Series([family, given], index=['name.family','name.given'])
-        return pd.Series([None, None], index=['name.family','name.given'])
-    if 'name' in df.columns:
-        name_comp = df['name'].apply(extract_name)
-        df = pd.concat([df.drop('name',axis=1), name_comp], axis=1)
-    df = df.rename(columns={'meta.lastUpdated':'lastUpdated'})
-    df = df.drop(columns=['meta','identifier','meta.versionId','managingOrganization.reference'], errors='ignore')
-    priority = ['id','name.family','name.given','birthDate','gender','lastUpdated']
-    others = [c for c in df.columns if c not in priority]
-    return df[[c for c in priority if c in df.columns] + others]
 
-# ==========================================
-# Normalizer: Observations
-# ==========================================
-def normalize_fhir_observations(obs_list):
-    if not obs_list:
-        return pd.DataFrame()
-    df = pd.json_normalize(obs_list, sep='.')
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["date", "value"]).sort_values("date")
+    return df
 
-    def obs_name(row):
-        cod = row.get('code.coding')
-        if isinstance(cod, list) and cod:
-            first = cod[0]
-            if isinstance(first, dict):
-                return first.get('display') or first.get('code') or row.get('code.text')
-        return row.get('code.text') or None
-
-    df['observation_name'] = df.apply(obs_name, axis=1)
-
-    def extract_val(row):
-        vq = row.get('valueQuantity')
-        if isinstance(vq, dict):
-            return pd.Series([vq.get('value'), vq.get('unit')], index=['value','unit'])
-        return pd.Series([
-            row.get('valueQuantity.value') or row.get('value'),
-            row.get('valueQuantity.unit') or row.get('unit')
-        ], index=['value','unit'])
-
-    vals = df.apply(extract_val, axis=1)
-    df = pd.concat([df, vals], axis=1)
-
-    def get_date(row):
-        for k in ('issued','effectiveDateTime','effective.dateTime'):
-            if k in row and pd.notna(row[k]):
-                return row[k]
-        return None
-
-    df['date'] = pd.to_datetime(df.apply(get_date, axis=1), errors='coerce')
-    df['value'] = pd.to_numeric(df['value'], errors='coerce')
-
-    df = df.drop(columns=['code','meta','subject','resourceType','status','valueQuantity'], errors='ignore')
-    cols = ['id','observation_name','value','unit','date']
-    others = [c for c in df.columns if c not in cols]
-    return df[[c for c in cols if c in df.columns] + others]
-
-# ==========================================
-# Sidebar: Config + Fetch
-# ==========================================
+# ============================
+# Sidebar / Inputs
+# ============================
 st.sidebar.title("⚙️ Konfiguration")
 fhir_base = st.sidebar.text_input("FHIR Server Base URL:", value="http://localhost:8081/fhir")
 fetch_btn = st.sidebar.button("Fetch Patients")
@@ -129,7 +166,9 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Startdatum (optional)")
 start_date = st.sidebar.date_input("Startdatum (ab):", value=None)
 
-# Fetch patients on demand
+# ============================
+# Fetch patients
+# ============================
 if fetch_btn:
     fetch_url = f"{fhir_base}/Patient"
     if start_date:
@@ -139,137 +178,153 @@ if fetch_btn:
         patients = safe_fhir_fetch_cached(fetch_url, "Patient")
     if patients:
         st.success(f"{len(patients)} Patienten geladen.")
-        st.session_state['patients'] = normalize_fhir_patients(patients)
+        st.session_state["patients"] = pd.json_normalize(patients, sep=".")
+        dfp = st.session_state["patients"]
+        if "name" in dfp.columns:
+            def _extract_name(n):
+                if isinstance(n, list) and n:
+                    first = n[0]
+                    family = first.get("family")
+                    given = first.get("given", [None])[0] if isinstance(first.get("given"), list) else first.get("given")
+                    return pd.Series([family, given])
+                return pd.Series([None, None])
+            names = dfp["name"].apply(_extract_name)
+            names.columns = ["name.family", "name.given"]
+            st.session_state["patients"] = pd.concat([dfp.drop(columns=["name"], errors="ignore"), names], axis=1)
     else:
         st.warning("Keine Patienten gefunden oder Abruf fehlgeschlagen.")
+        st.session_state["patients"] = pd.DataFrame()
 
-if 'patients' not in st.session_state:
-    st.session_state['patients'] = pd.DataFrame()
+if "patients" not in st.session_state:
+    st.session_state["patients"] = pd.DataFrame()
 
-# ==========================================
-# Main: wenn Patienten vorhanden
-# ==========================================
-if not st.session_state['patients'].empty:
-    df_pat = st.session_state['patients'].copy()
-    # full name
-    if 'name.given' in df_pat.columns and 'name.family' in df_pat.columns:
-        df_pat['full_name'] = (df_pat['name.given'].fillna('') + ' ' + df_pat['name.family'].fillna('')).str.strip()
-    else:
-        df_pat['full_name'] = df_pat.get('id', '').astype(str)
-
-    df_pat['display'] = df_pat.apply(lambda r: f"{r['full_name']} (ID:{str(r['id'])[:8]})", axis=1)
-    patient_choice = st.sidebar.selectbox("Patient auswählen:", df_pat['display'].tolist())
-    selected_row = df_pat[df_pat['display'] == patient_choice].iloc[0]
-    patient_id = selected_row['id']
-
-    st.subheader(f"Patient: {selected_row['full_name']} — ID: {patient_id}")
-
-    # fetch observations
-    obs_url = f"{fhir_base}/Observation?subject=Patient/{patient_id}"
-    st.info(f"Abrufe Observations: `{obs_url}`")
-    with st.spinner("Hole Observations..."):
-        observations = safe_fhir_fetch_cached(obs_url, "Observation")
-
-    if not observations:
-        st.warning("Keine Observations für diesen Patienten.")
-        st.stop()
-
-    df_obs = normalize_fhir_observations(observations)
-    if df_obs.empty:
-        st.warning("Keine verwertbaren Observations.")
-        st.stop()
-
-    # Filter: observation types
-    available = sorted(df_obs['observation_name'].dropna().unique().tolist())
-    selected_obs = st.sidebar.multiselect("Observation-Typen:", options=available, default=available[:3] if available else [])
-
-    if selected_obs:
-        df_filtered = df_obs[df_obs['observation_name'].isin(selected_obs)].copy()
-    else:
-        df_filtered = df_obs.copy()
-
-    # optionaler Start-Datum-Filter (wie ursprünglich: nur applied wenn gesetzt)
-    if start_date:
-        # Vergleiche nur datum ohne timezone
-        df_filtered = df_filtered.dropna(subset=['date']).copy()
-        df_filtered = df_filtered[df_filtered['date'].dt.date >= start_date]
-
-    # drop rows ohne date oder value
-    df_filtered = df_filtered.dropna(subset=['date','value']).copy()
-
-    if df_filtered.empty:
-        st.warning("Keine Daten nach Filtern vorhanden.")
-        st.stop()
-
-    # --------------------------
-    # KPI Bereich
-    # --------------------------
-    total_count = len(df_filtered)
-    unique_obs = df_filtered['observation_name'].nunique()
-    first_date = df_filtered['date'].min()
-    last_date = df_filtered['date'].max()
-    overall_mean = df_filtered['value'].mean()
-
-    k1, k2, k3, k4 = st.columns([1.2,1,1,1])
-    k1.metric("🔢 Messwerte (Zeilen)", value=f"{total_count}")
-    k2.metric("📌 Observation-Typen", value=f"{unique_obs}")
-    k3.metric("🗓️ Erstes Datum", value=first_date.strftime("%Y-%m-%d") if pd.notna(first_date) else "—")
-    k4.metric("🗓️ Letztes Datum", value=last_date.strftime("%Y-%m-%d") if pd.notna(last_date) else "—")
-
-    # kleine zweite Zeile mit Durchschnitt (format)
-    c1, c2 = st.columns([1,2])
-    c1.metric("📊 Durchschnittswert (gesamt)", value=f"{overall_mean:.2f}" if pd.notna(overall_mean) else "—")
-    # Anzeige: kurze Beschreibung
-    c2.write("Filter angewendet: " + (", ".join(selected_obs) if selected_obs else "alle") + (f"; ab {start_date}" if start_date else ""))
-
-    # --------------------------
-    # Per-Observation Statistik (count, mean, min, max)
-    # --------------------------
-    stats = df_filtered.groupby('observation_name')['value'].agg(['count','mean','min','max']).reset_index()
-    stats['mean'] = stats['mean'].round(2)
-    stats['min'] = stats['min'].round(2)
-    stats['max'] = stats['max'].round(2)
-    st.markdown("### 🔎 Statistik pro Observation")
-    st.dataframe(stats, use_container_width=True)
-
-    # --------------------------
-    # Plot
-    # --------------------------
-    df_plot = df_filtered.sort_values('date')
-    fig = px.line(
-        df_plot,
-        x='date',
-        y='value',
-        color='observation_name',
-        markers=True,
-        title="Zeitverlauf der ausgewählten Observations",
-        labels={'date':'Datum','value':'Wert','observation_name':'Observation'}
-    )
-    if 'unit' in df_plot.columns:
-        fig.update_traces(hovertemplate='%{x}<br>%{y} %{customdata[0]}<br>%{fullData.name}', customdata=df_plot[['unit']].values)
-    fig.update_layout(
-        xaxis=dict(
-            rangeslider=dict(visible=True),
-            rangeselector=dict(buttons=[
-                dict(count=7,label="7d",step="day",stepmode="backward"),
-                dict(count=30,label="30d",step="day",stepmode="backward"),
-                dict(count=90,label="90d",step="day",stepmode="backward"),
-                dict(step="all")
-            ]),
-            type="date"
-        ),
-        legend_title_text='Observation'
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --------------------------
-    # Datenansicht + Export
-    # --------------------------
-    st.markdown("### 🗂️ Gefilterte Rohdaten")
-    st.dataframe(df_filtered.sort_values('date').reset_index(drop=True), use_container_width=True)
-
-    csv = df_filtered.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 CSV herunterladen", csv, file_name=f"observations_patient_{patient_id}.csv", mime='text/csv')
-
-else:
+if st.session_state["patients"].empty:
     st.info("Bitte zuerst Patienten laden (Button in der Sidebar).")
+    st.stop()
+
+# ============================
+# Patient selection
+# ============================
+df_pat = st.session_state["patients"].copy()
+patient_count = len(df_pat)
+
+# KPI oben: Wie viele Patienten erfasst
+st.markdown("### 👥 Patientenübersicht")
+col1, col2 = st.columns([1, 3])
+col1.metric("📋 Anzahl erfasster Patienten", f"{patient_count}")
+col2.write("Wähle unten einen Patienten aus, um Laborwerte anzuzeigen.")
+
+if "name.given" in df_pat.columns and "name.family" in df_pat.columns:
+    df_pat["full_name"] = (df_pat["name.given"].fillna("") + " " + df_pat["name.family"].fillna("")).str.strip()
+else:
+    df_pat["full_name"] = df_pat.get("id", "").astype(str)
+df_pat["display"] = df_pat.apply(lambda r: f"{r['full_name']} (ID:{str(r.get('id',''))[:8]})", axis=1)
+
+patient_choice = st.sidebar.selectbox("Patient auswählen:", df_pat["display"].tolist())
+selected = df_pat[df_pat["display"] == patient_choice].iloc[0]
+patient_id = selected.get("id")
+
+st.subheader(f"🧍 Patient: {selected.get('full_name','-')} — ID: {patient_id}")
+
+# ============================
+# Fetch Observations (nur Laborwerte)
+# ============================
+obs_url = f"{fhir_base}/Observation?subject=Patient/{patient_id}"
+with st.spinner("Hole Observations..."):
+    observations = safe_fhir_fetch_cached(obs_url, "Observation")
+
+if not observations:
+    st.warning("Keine Observations gefunden.")
+    st.stop()
+
+# Labor-Filterung & Statistik
+total_count = len(observations)
+lab_obs = [o for o in observations if is_labor_observation(o)]
+lab_count = len(lab_obs)
+excluded = total_count - lab_count
+percent = (lab_count / total_count * 100) if total_count > 0 else 0
+st.info(f"Gesamt: {total_count} Observations | Laborwerte: {lab_count} ({percent:.1f}%) | Ausgeschlossen: {excluded}")
+
+df_obs = normalize_fhir_observations(lab_obs)
+if df_obs.empty:
+    st.warning("Keine Laborwerte mit numerischem valueQuantity gefunden.")
+    st.stop()
+
+# ============================
+# Auswahl der Observations
+# ============================
+available = sorted(df_obs["observation_name"].dropna().unique().tolist())
+selected_obs = st.sidebar.multiselect("Laborwerte auswählen:", options=available, default=[])
+
+if not selected_obs:
+    st.info("Bitte mindestens einen Laborwert auswählen (Sidebar).")
+    st.stop()
+
+df_filtered = df_obs[df_obs["observation_name"].isin(selected_obs)].copy()
+if start_date:
+    df_filtered = df_filtered[df_filtered["date"].dt.date >= start_date]
+
+if df_filtered.empty:
+    st.warning("Keine Daten nach Filterung vorhanden.")
+    st.stop()
+
+# ============================
+# KPIs
+# ============================
+total_count = len(df_filtered)
+unique_obs = int(df_filtered["observation_name"].nunique())
+first_date = df_filtered["date"].min()
+last_date = df_filtered["date"].max()
+
+k1, k2, k3, k4 = st.columns([1.2, 1, 1, 1])
+k1.metric("🔢 Messwerte (gefiltert)", f"{total_count}")
+k2.metric("🧪 Laborwerte (Typen)", f"{unique_obs}")
+k3.metric("📆 Erstes Datum", first_date.strftime("%Y-%m-%d") if pd.notna(first_date) else "—")
+k4.metric("📆 Letztes Datum", last_date.strftime("%Y-%m-%d") if pd.notna(last_date) else "—")
+
+# ============================
+# Statistik pro Observation
+# ============================
+stats = df_filtered.groupby("observation_name")["value"].agg(count="count", mean="mean", min="min", max="max").reset_index()
+stats[["mean", "min", "max"]] = stats[["mean", "min", "max"]].round(2)
+st.markdown("### 📊 Statistik pro Laborwert")
+st.dataframe(stats, use_container_width=True)
+
+# ============================
+# Plot (mit korrekt formatiertem Hover)
+# ============================
+fig = px.line(
+    df_filtered,
+    x="date",
+    y="value",
+    color="observation_name",
+    markers=True,
+    labels={"date": "Datum", "value": "Wert", "observation_name": "Laborwert"},
+    title="Zeitverlauf der ausgewählten Laborwerte",
+)
+fig.update_traces(
+    hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y} %{customdata[0]}<br>%{fullData.name}",
+    customdata=df_filtered[["unit"]].values
+)
+fig.update_layout(
+    xaxis=dict(
+        rangeslider=dict(visible=True),
+        rangeselector=dict(buttons=[
+            dict(count=7, label="7d", step="day", stepmode="backward"),
+            dict(count=30, label="30d", step="day", stepmode="backward"),
+            dict(count=90, label="90d", step="day", stepmode="backward"),
+            dict(step="all")
+        ]),
+        type="date"
+    ),
+    legend_title_text="Laborwert"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# ============================
+# Rohdaten + Export
+# ============================
+st.markdown("### 🗂️ Gefilterte Rohdaten")
+st.dataframe(df_filtered.sort_values("date").reset_index(drop=True), use_container_width=True)
+csv = df_filtered.to_csv(index=False).encode("utf-8")
+st.download_button("📥 CSV herunterladen", csv, file_name=f"laborwerte_patient_{patient_id}.csv", mime="text/csv")
