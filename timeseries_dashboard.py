@@ -28,17 +28,18 @@ def _safe_fhir_fetch(url: str, resource_type: str) -> List[Dict[str, Any]]:
         try:
             resp = session.get(current_url, headers={"Accept": "application/fhir+json"}, timeout=30)
             resp.raise_for_status()
-            bundle = resp.json()
+            # .json() parst diesen JSON-Text in eine native Python-Datenstruktur (in diesem Fall ein dict, also ein Dictionary)
+            bundle = resp.json() 
         except Exception as e:
             st.error(f"Fehler beim Abruf von {current_url}: {e}")
             break
-
+        # prüfe ob es sich um ein Bundle handelt
         if isinstance(bundle, dict) and bundle.get("resourceType") == "Bundle" and "entry" in bundle:
             for entry in bundle["entry"]:
                 resource = entry.get("resource")
                 if isinstance(resource, dict) and resource.get("resourceType") == resource_type:
                     accumulated.append(resource)
-
+        #Paginierungs-Logik
         next_url = None
         if isinstance(bundle, dict):
             for link in bundle.get("link", []) or []:
@@ -60,11 +61,12 @@ def is_labor_observation(resource: Dict[str, Any]) -> bool:
     """Filtert Observations, die als Laborwerte gelten."""
     if not isinstance(resource, dict):
         return False
-
+    #Ein Laborwert braucht ein Datum
     if not resource.get("issued"):
         return False
 
     # Prüfe valueQuantity (direkt oder in Komponenten)
+    #Prüft, ob die Observation direkt einen numerischen Wert hat
     has_numeric = False
     vq = resource.get("valueQuantity")
     if isinstance(vq, dict) and vq.get("value") is not None:
@@ -150,8 +152,11 @@ def normalize_fhir_observations(obs_list: List[Dict[str, Any]]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
+    #Konvertiert die Datums-Spalte, die derzeit aus Text besteht, in echte Datums-Objekte.
+    #errors="coerce": Wenn ein Datum ungültig ist (z. B. "Text"), wird es in NaT (Not a Time) umgewandelt, anstatt einen Fehler zu werfen.
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    #Datenbereinigung: Entfernt Zeilen mit fehlenden Daten in den "date"- oder "value"-Spalten und sortiert die Daten nach Datum.
     df = df.dropna(subset=["date", "value"]).sort_values("date")
     return df
 
@@ -178,6 +183,8 @@ if fetch_btn:
         patients = safe_fhir_fetch_cached(fetch_url, "Patient")
     if patients:
         st.success(f"{len(patients)} Patienten geladen.")
+        #session_state speichern, so dass Patients für die gesamte Sitzung des Benutzers verfügbar bleiben.
+        #json_normalize: Wandelt verschachtelte JSON-Daten in ein flaches Tabellenformat um.(name.family, name.given)
         st.session_state["patients"] = pd.json_normalize(patients, sep=".")
         dfp = st.session_state["patients"]
         if "name" in dfp.columns:
@@ -273,14 +280,10 @@ if df_filtered.empty:
 # ============================
 total_count = len(df_filtered)
 unique_obs = int(df_filtered["observation_name"].nunique())
-first_date = df_filtered["date"].min()
-last_date = df_filtered["date"].max()
 
-k1, k2, k3, k4 = st.columns([1.2, 1, 1, 1])
+k1, k2= st.columns([1, 1])
 k1.metric("🔢 Messwerte (gefiltert)", f"{total_count}")
-k2.metric("🧪 Laborwerte (Typen)", f"{unique_obs}")
-k3.metric("📆 Erstes Datum", first_date.strftime("%Y-%m-%d") if pd.notna(first_date) else "—")
-k4.metric("📆 Letztes Datum", last_date.strftime("%Y-%m-%d") if pd.notna(last_date) else "—")
+k2.metric("🧪 Laborwerte", f"{unique_obs}")
 
 # ============================
 # Statistik pro Observation
