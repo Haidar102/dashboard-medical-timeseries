@@ -280,18 +280,21 @@ if df_filtered.empty:
 # ============================
 total_count = len(df_filtered)
 unique_obs = int(df_filtered["observation_name"].nunique())
+first_date = df_filtered["date"].min()
+last_date = df_filtered["date"].max()
 
-k1, k2= st.columns([1, 1])
+k1, k2, k3, k4 = st.columns([1.2, 1, 1, 1])
 k1.metric("🔢 Messwerte (gefiltert)", f"{total_count}")
 k2.metric("🧪 Laborwerte", f"{unique_obs}")
-
+k3.metric("📆 Erstes Datum", first_date.strftime("%Y-%m-%d") if pd.notna(first_date) else "—")
+k4.metric("📆 Letztes Datum", last_date.strftime("%Y-%m-%d") if pd.notna(last_date) else "—")
 # ============================
 # Statistik pro Observation
 # ============================
 stats = df_filtered.groupby("observation_name")["value"].agg(count="count", mean="mean", min="min", max="max").reset_index()
 stats[["mean", "min", "max"]] = stats[["mean", "min", "max"]].round(2)
 st.markdown("### 📊 Statistik pro Laborwert")
-st.dataframe(stats, width=True)
+st.dataframe(stats, use_container_width=True)
 
 # ============================
 # Plot (mit korrekt formatiertem Hover)
@@ -322,12 +325,12 @@ fig.update_layout(
     ),
     legend_title_text="Laborwert"
 )
-st.plotly_chart(fig, width=True)
+st.plotly_chart(fig, use_container_width=True)
 
 # ============================
 # Rohdaten + Export
 # ============================
 st.markdown("### 🗂️ Gefilterte Rohdaten")
-st.dataframe(df_filtered.sort_values("date").reset_index(drop=True), width=True)
+st.dataframe(df_filtered.sort_values("date").reset_index(drop=True), use_container_width=True)
 csv = df_filtered.to_csv(index=False).encode("utf-8")
 st.download_button("📥 CSV herunterladen", csv, file_name=f"laborwerte_patient_{patient_id}.csv", mime="text/csv")
