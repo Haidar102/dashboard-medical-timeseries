@@ -291,7 +291,7 @@ k2.metric("🧪 Laborwerte", f"{unique_obs}")
 stats = df_filtered.groupby("observation_name")["value"].agg(count="count", mean="mean", min="min", max="max").reset_index()
 stats[["mean", "min", "max"]] = stats[["mean", "min", "max"]].round(2)
 st.markdown("### 📊 Statistik pro Laborwert")
-st.dataframe(stats, use_container_width=True)
+st.dataframe(stats, width=True)
 
 # ============================
 # Plot (mit korrekt formatiertem Hover)
@@ -322,12 +322,12 @@ fig.update_layout(
     ),
     legend_title_text="Laborwert"
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width=True)
 
 # ============================
 # Rohdaten + Export
 # ============================
 st.markdown("### 🗂️ Gefilterte Rohdaten")
-st.dataframe(df_filtered.sort_values("date").reset_index(drop=True), use_container_width=True)
+st.dataframe(df_filtered.sort_values("date").reset_index(drop=True), width=True)
 csv = df_filtered.to_csv(index=False).encode("utf-8")
 st.download_button("📥 CSV herunterladen", csv, file_name=f"laborwerte_patient_{patient_id}.csv", mime="text/csv")
