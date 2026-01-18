@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import requests
+import numpy as np
 from requests.adapters import HTTPAdapter, Retry
 from datetime import date
 from typing import Any, Dict, List
@@ -28,7 +29,7 @@ def _safe_fhir_fetch(url: str, resource_type: str) -> List[Dict[str, Any]]:
         try:
             resp = session.get(current_url, headers={"Accept": "application/fhir+json"}, timeout=30)
             resp.raise_for_status()
-            # .json() parst diesen JSON-Text in eine native Python-Datenstruktur (in diesem Fall ein dict, also ein Dictionary)
+            # .json() parst diesen JSON-Text in eine native Python-Datenstruktur (Dictionary)
             bundle = resp.json() 
         except Exception as e:
             st.error(f"Fehler beim Abruf von {current_url}: {e}")
@@ -57,7 +58,7 @@ def safe_fhir_fetch_cached(url: str, resource_type: str) -> List[Dict[str, Any]]
 # ============================
 # Filter: Nur Laborwerte
 # ============================
-def is_labor_observation(resource: Dict[str, Any]) -> bool:
+def is_labor_observation(resource: Dict[str, Any],vitalsigns:bool) -> bool:
     """Filtert Observations, die als Laborwerte gelten."""
     if not isinstance(resource, dict):
         return False
@@ -65,7 +66,7 @@ def is_labor_observation(resource: Dict[str, Any]) -> bool:
     if not resource.get("issued"):
         return False
 
-    # Prüfe valueQuantity (direkt oder in Komponenten)
+    #Prüfe valueQuantity (direkt oder in Komponenten)
     #Prüft, ob die Observation direkt einen numerischen Wert hat
     has_numeric = False
     vq = resource.get("valueQuantity")
@@ -86,14 +87,17 @@ def is_labor_observation(resource: Dict[str, Any]) -> bool:
         for c in (cat.get("coding") or []):
             cats.append((c.get("code") or "").lower())
             cats.append((c.get("display") or "").lower())
-
-    is_lab = any("laboratory" in c for c in cats)
-    return is_lab
+    if vitalsigns:
+        is_lab = any("laboratory" or "vital-signs" in c for c in cats)
+        return is_lab
+    else:
+        is_lab = any("laboratory" in c for c in cats)
+        return is_lab
 
 # ============================
 # Normalisierung für Laborwerte
 # ============================
-def normalize_fhir_observations(obs_list: List[Dict[str, Any]]) -> pd.DataFrame:
+def normalize_fhir_observations(obs_list: List[Dict[str, Any]],vitalsign:bool) -> pd.DataFrame:
     rows = []
 
     def _to_float(v):
@@ -108,7 +112,7 @@ def normalize_fhir_observations(obs_list: List[Dict[str, Any]]) -> pd.DataFrame:
             return None
 
     for res in obs_list:
-        if not is_labor_observation(res):
+        if not is_labor_observation(res,vitalsign):
             continue
 
         obs_name = None
@@ -154,12 +158,81 @@ def normalize_fhir_observations(obs_list: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     #Konvertiert die Datums-Spalte, die derzeit aus Text besteht, in echte Datums-Objekte.
     #errors="coerce": Wenn ein Datum ungültig ist (z. B. "Text"), wird es in NaT (Not a Time) umgewandelt, anstatt einen Fehler zu werfen.
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    #utc=True sorgt dafür, dass +01:00 und +02:00 einheitlich behandelt werden
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     #Datenbereinigung: Entfernt Zeilen mit fehlenden Daten in den "date"- oder "value"-Spalten und sortiert die Daten nach Datum.
     df = df.dropna(subset=["date", "value"]).sort_values("date")
     return df
 
+# ============================
+# Helper: Zeit-Clustering (Z-Score ODER Feste Tage)
+# ============================
+def apply_clustering(df: pd.DataFrame, method: str = "none", max_gap_days: int = 0) -> pd.DataFrame:
+    """
+    Unterteilt Zeitreihen in Cluster.
+    method: 'zscore', 'fixed' oder 'none'
+    max_gap_days: Schwellenwert in Tagen (nur für method='fixed')
+    """
+    df_out = df.copy()
+    df_out = df_out.sort_values("date")
+    
+    # Default: Alles ist eine Gruppe (alles verbunden)
+    df_out["line_group_id"] = df_out["observation_name"] 
+    print("Default( df_out[line_group_id])", df_out["line_group_id"])
+
+    # Wenn "Keine" gewählt ist oder zu wenig Daten da sind -> Abbruch
+    if method == "none" or len(df_out) < 2:
+        print("No clustering applied(df_out):", df_out )
+        return df_out
+    
+
+    timestamps = df_out["date"].tolist()
+    # Berechne Lücken in Sekunden
+    gaps = [(timestamps[i+1] - timestamps[i]).total_seconds() for i in range(len(timestamps) - 1)]
+    
+    if not gaps:
+        return df_out
+
+    cluster_id = 0
+    cluster_ids = [0] # Erster Punkt ist immer Cluster 0
+
+    # --- LOGIK 1: Z-SCORE (Statistisch) ---
+    if method == "zscore":
+        mean_gap = np.mean(gaps)
+        std_gap = np.std(gaps)
+        
+        # Wenn Varianz 0 ist (alle Abstände gleich), keine Ausreißer möglich
+        if std_gap == 0:
+            return df_out
+
+        for gap in gaps:
+            z_score = (gap - mean_gap) / std_gap
+            if z_score > 2.5:
+                cluster_id += 1
+            cluster_ids.append(cluster_id)
+
+    # --- LOGIK 2: FESTE TAGE (Manuell) ---
+    elif method == "fixed":
+        # Umrechnung Tage -> Sekunden
+        max_gap_seconds = max_gap_days * 24 * 60 * 60
+        
+        for gap in gaps:
+            if gap > max_gap_seconds:
+                cluster_id += 1
+            cluster_ids.append(cluster_id)
+
+    else:
+        # Fallback, falls irgendwas falsches übergeben wurde
+        return df_out
+    
+    # Zuweisung der neuen IDs
+    df_out["cluster_id"] = cluster_ids
+    # Plotly trennt Linien, wenn sich der Name in "line_group" ändert
+    df_out["line_group_id"] = df_out["observation_name"] + "_Cl" + df_out["cluster_id"].astype(str)
+    print("Clustered df_out:(df_out[line_group_id])",  df_out["line_group_id"]) #DEBUG
+    print("df_out:(df_out)", df_out) #DEBUG
+    return df_out
 # ============================
 # Sidebar / Inputs
 # ============================
@@ -228,13 +301,14 @@ else:
 df_pat["display"] = df_pat.apply(lambda r: f"{r['full_name']} (ID:{str(r.get('id',''))[:8]})", axis=1)
 
 patient_choice = st.sidebar.selectbox("Patient auswählen:", df_pat["display"].tolist())
+checkbox_vitalsigns = st.sidebar.checkbox("Vital Signs als Laborwerte einbeziehen", value=False)
 selected = df_pat[df_pat["display"] == patient_choice].iloc[0]
 patient_id = selected.get("id")
 
 st.subheader(f"🧍 Patient: {selected.get('full_name','-')} — ID: {patient_id}")
 
 # ============================
-# Fetch Observations (nur Laborwerte)
+# Fetch Observations (nur Laborwerte oder auch Vital Signs)
 # ============================
 obs_url = f"{fhir_base}/Observation?subject=Patient/{patient_id}"
 with st.spinner("Hole Observations..."):
@@ -246,13 +320,13 @@ if not observations:
 
 # Labor-Filterung & Statistik
 total_count = len(observations)
-lab_obs = [o for o in observations if is_labor_observation(o)]
+lab_obs = [o for o in observations if is_labor_observation(o,checkbox_vitalsigns)]
 lab_count = len(lab_obs)
 excluded = total_count - lab_count
 percent = (lab_count / total_count * 100) if total_count > 0 else 0
 st.info(f"Gesamt: {total_count} Observations | Laborwerte: {lab_count} ({percent:.1f}%) | Ausgeschlossen: {excluded}")
 
-df_obs = normalize_fhir_observations(lab_obs)
+df_obs = normalize_fhir_observations(lab_obs,checkbox_vitalsigns)
 if df_obs.empty:
     st.warning("Keine Laborwerte mit numerischem valueQuantity gefunden.")
     st.stop()
@@ -297,7 +371,7 @@ st.markdown("### 📊 Statistik pro Laborwert")
 st.dataframe(stats, use_container_width=True)
 
 # ============================
-# Plot (mit korrekt formatiertem Hover)
+# Plot
 # ============================
 fig = px.line(
     df_filtered,
@@ -312,25 +386,197 @@ fig.update_traces(
     hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y} %{customdata[0]}<br>%{fullData.name}",
     customdata=df_filtered[["unit"]].values
 )
+
+
+# ----- Jahresfilter -----
+print("Available years:", df_filtered["date"])
+years_available = sorted(df_filtered["date"].dt.year.unique())
+selected_year = st.selectbox(
+    "Jahr auswählen (optional):",
+    options=["Alle"] + list(map(str, years_available)),
+    index=0
+)
+
+# DataFrame kopieren
+filtered_df = df_filtered.copy()
+
+# ----- Falls ein Jahr gewählt wurde: Nach Jahr filtern -----
+if selected_year != "Alle":
+    year_int = int(selected_year)
+    filtered_df = filtered_df[filtered_df["date"].dt.year == year_int]
+
+    # Monat-Filter nur anzeigen, wenn ein Jahr ausgewählt ist
+    months_available = sorted(filtered_df["date"].dt.month.unique())
+    month_names = {
+        1:"Januar", 2:"Februar", 3:"März", 4:"April",
+        5:"Mai", 6:"Juni", 7:"Juli", 8:"August",
+        9:"September", 10:"Oktober", 11:"November", 12:"Dezember"
+    }
+
+    selected_month_label = st.selectbox(
+        "Monat auswählen (optional):",
+        options=["Alle"] + [month_names[m] for m in months_available]
+    )
+
+    # Monat anwenden
+    if selected_month_label != "Alle":
+        # Namen wieder in Nummer umwandeln
+        selected_month = [k for k, v in month_names.items() if v == selected_month_label][0]
+        filtered_df = filtered_df[filtered_df["date"].dt.month == selected_month]
+
+# Falls nach Jahr/Monat-Filter keine Daten übrig sind:
+if filtered_df.empty:
+    st.warning("Für den gewählten Zeitraum sind keine Daten vorhanden.")
+    st.stop()
+
+# ----- RangeSelector Buttons -----
+range_buttons = [
+    dict(count=7, label="7d", step="day", stepmode="backward"),
+    dict(count=30, label="30d", step="day", stepmode="backward"),
+    dict(count=90, label="90d", step="day", stepmode="backward"),
+    dict(step="all", label="Alle")
+]
+
+
+# ----- Diagramm -----
+# ============================
+# Plot Logik mit Clustering-Auswahl
+# ============================
+st.markdown("### 🔗 Linien-Verbindung (Clustering)")
+
+# 1. Auswahlmenü
+clustering_mode = st.radio(
+    "Wie sollen Lücken behandelt werden?",
+    options=["Alles verbinden (Kein Clustering)", "Smart Clustering (Z-Score)", "Manuelle Lücke (Tage)"],
+    index=0,
+    horizontal=True
+)
+
+#Info-Hinweis für Smart Clustering ---
+if clustering_mode == "Smart Clustering (Z-Score)":
+    st.info(
+        "**💡 Information zum Smart Clustering:**\n\n"
+        "Diese Funktion erkennt automatisch **ungewöhnlich lange Zeitabstände** zwischen den Messungen, "
+        "die vom sonst üblichen Rhythmus dieses Patienten abweichen.\n\n"
+        "* **Warum wird die Linie unterbrochen?** Wenn zwischen zwei Laborwerten eine Pause liegt, die deutlich "
+        "länger ist als die restlichen Intervalle, trennt das System die Verbindung.\n"
+        "* **Klinischer Nutzen:** Dies verhindert, dass bei unregelmäßigen Messungen (z. B. nach einer langen "
+        "Behandlungspause) ein falscher Trend suggeriert wird. So sehen Sie nur Zusammenhänge dort, wo die "
+        "Werte auch zeitlich nah beieinander liegen."
+    )
+# -----------------------------------------------
+
+
+# 2. Variable für die Tage-Einstellungen vorbereiten
+#speichern die Einstellungen in einem Dictionary: {"Glucose": 10, "HbA1c": 90}
+custom_gap_map = {} 
+
+if clustering_mode == "Manuelle Lücke (Tage)":
+    st.markdown("#### 🛠️ Individuelle Einstellungen")
+    st.info("Bestimmen Sie für jeden Laborwert, ab wie vielen Tagen Lücke die Linie unterbrochen werden soll.")
+    
+    # Erstelle für JEDEN ausgewählten Laborwert einen eigenen Regler
+    # nutzen st.columns, um Platz zu sparen (2 Regler nebeneinander)
+    cols = st.columns(2)
+    
+    for i, obs_name in enumerate(selected_obs):
+        with cols[i % 2]: # Wechselt zwischen linker und rechter Spalte
+            days = st.number_input(
+                f"Max. Lücke für '{obs_name}' (Tage):",
+                min_value=1, 
+                max_value=730, 
+                value=30, # Standardwert
+                step=1,
+                key=f"gap_input_{obs_name}" # WICHTIG: Eindeutige ID für Streamlit
+            )
+            custom_gap_map[obs_name] = days
+
+plot_df = filtered_df.copy()
+
+# Mapping für die interne Funktion
+method_map = {
+    "Alles verbinden (Kein Clustering)": "none",
+    "Smart Clustering (Z-Score)": "zscore",
+    "Manuelle Lücke (Tage)": "fixed"
+}
+selected_method = method_map[clustering_mode]
+
+# 3. Anwendung der Logik
+if selected_method != "none":
+    clustered_frames = []
+    
+    # Gruppieren nach Laborwert
+    for name, group in plot_df.groupby("observation_name"):
+        
+        # Welchen Tag-Wert nehmen wir?
+        # Wenn "Manuell" aktiv ist, hole den Wert aus dem Dictionary. 
+        # Falls name nicht drin ist (Fallback), nimm 30.
+        current_max_days = custom_gap_map.get(name, 30)
+        
+        clustered_frames.append(
+            apply_clustering(group, method=selected_method, max_gap_days=current_max_days)
+        )
+        
+    if clustered_frames:
+        plot_df = pd.concat(clustered_frames)
+else:
+    # Fallback: Alles verbinden
+    plot_df["line_group_id"] = plot_df["observation_name"]
+
+# ----- Diagramm -----
+
+
+if len(selected_obs) == 1:
+    # Falls nur ein Wert ausgewählt ist, nehmen wir die Einheit aus dem ersten Datensatz
+    einheit = plot_df["unit"].iloc[0] if not plot_df.empty else ""
+    obervationname= plot_df["observation_name"].iloc[0] if not plot_df.empty else ""
+    y_label = f"{obervationname} ({einheit})" if einheit else "Wert"
+else:
+    # Falls mehrere Werte ausgewählt sind
+    y_label = "Wert"
+
+fig = px.line(
+    plot_df,
+    x="date",
+    y="value",
+    color="observation_name",
+    line_group="line_group_id", # Hier wird getrennt
+    markers=True,
+    labels={
+        "date": "Datum",
+        "value": y_label,
+        "observation_name": "Laborwert"
+    },
+    title="Zeitverlauf der ausgewählten Laborwerte"
+)
+
+# Hover
+fig.update_traces(
+    hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y} %{customdata[0]}<br>%{fullData.name}",
+    customdata=plot_df[["unit"]].values
+)
+
 fig.update_layout(
     xaxis=dict(
         rangeslider=dict(visible=True),
-        rangeselector=dict(buttons=[
-            dict(count=7, label="7d", step="day", stepmode="backward"),
-            dict(count=30, label="30d", step="day", stepmode="backward"),
-            dict(count=90, label="90d", step="day", stepmode="backward"),
-            dict(step="all")
-        ]),
+        rangeselector=dict(buttons=range_buttons),
         type="date"
     ),
     legend_title_text="Laborwert"
 )
+
 st.plotly_chart(fig, use_container_width=True)
 
 # ============================
 # Rohdaten + Export
 # ============================
 st.markdown("### 🗂️ Gefilterte Rohdaten")
-st.dataframe(df_filtered.sort_values("date").reset_index(drop=True), use_container_width=True)
-csv = df_filtered.to_csv(index=False).encode("utf-8")
-st.download_button("📥 CSV herunterladen", csv, file_name=f"laborwerte_patient_{patient_id}.csv", mime="text/csv")
+st.dataframe(filtered_df.sort_values("date").reset_index(drop=True), use_container_width=True)
+
+csv_data = filtered_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "📥 CSV herunterladen",
+    csv_data,
+    file_name=f"laborwerte_patient_{patient_id}.csv",
+    mime="text/csv"
+)
