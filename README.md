@@ -26,7 +26,11 @@ Abhängigkeiten installieren:
 
 ```bash
 pip install -r requirements.txt
+```
 
-Dann die Anwendung starten mit:
+Anwendung starten mit:
+
+```bash
 streamlit run timeseries_dashboard.py
+```
 
